@@ -157,8 +157,10 @@ module Database.PostgreSQL.LibPQ
     -- $asynccommand
     , sendQuery
     , sendQueryParams
+    , sendQueryParamsC
     , sendPrepare
     , sendQueryPrepared
+    , sendQueryPreparedC
     , sendDescribePrepared
     , sendDescribePortal
     , getResult
@@ -1703,6 +1705,41 @@ sendQueryParams connection statement params rFmt =
                                            )
 
 
+-- | Submits a command and separate parameters to the server without
+-- waiting for the result(s).
+sendQueryParamsC :: Connection
+                -> B.ByteString
+                -> [Maybe (Oid, B.ByteString, Format)]
+                -> Format
+                -> IO Bool
+sendQueryParamsC connection statement params rFmt =
+    do let (oids, values, lengths, formats) =
+               foldl' accum ([],[],[],[]) $ reverse params
+           !c_lengths = map toEnum lengths :: [CInt]
+           !n = toEnum $ length params
+           !f = toEnum $ fromEnum rFmt
+       enumFromConn connection $ \c ->
+           B.useAsCString statement $ \s ->
+               withArray oids $ \ts ->
+                   withMany (maybeWith B.unsafeUseAsCString) values $ \c_values ->
+                       withArray c_values $ \vs ->
+                           withArray c_lengths $ \ls ->
+                               withArray formats $ \fs ->
+                                   c_PQsendQueryParams c s n ts vs ls fs f
+
+    where
+      accum (!a,!b,!c,!d) Nothing = ( invalidOid:a
+                                    , Nothing:b
+                                    , 0:c
+                                    , 0:d
+                                    )
+      accum (!a,!b,!c,!d) (Just (t,v,f)) = ( t:a
+                                           , (Just v):b
+                                           , (B.length v):c
+                                           , (toEnum $ fromEnum f):d
+                                           )
+
+
 -- | Sends a request to create a prepared statement with the given
 -- parameters, without waiting for completion.
 sendPrepare :: Connection
@@ -1734,6 +1771,35 @@ sendQueryPrepared connection stmtName mPairs rFmt =
        enumFromConn connection $ \c ->
            B.useAsCString stmtName $ \s ->
                withMany (maybeWith B.useAsCString) values $ \c_values ->
+                   withArray c_values $ \vs ->
+                       withArray c_lengths $ \ls ->
+                           withArray formats $ \fs ->
+                               c_PQsendQueryPrepared c s n vs ls fs f
+
+    where
+      accum (!a,!b,!c) Nothing       = ( Nothing:a
+                                       , 0:b
+                                       , 0:c
+                                       )
+      accum (!a,!b,!c) (Just (v, f)) = ( (Just v):a
+                                       , (B.length v):b
+                                       , (toEnum $ fromEnum f):c
+                                       )
+
+
+sendQueryPreparedC :: Connection
+                  -> B.ByteString
+                  -> [Maybe (B.ByteString, Format)]
+                  -> Format
+                  -> IO Bool
+sendQueryPreparedC connection stmtName mPairs rFmt =
+    do let (values, lengths, formats) = foldl' accum ([],[],[]) $ reverse mPairs
+           !c_lengths = map toEnum lengths :: [CInt]
+           !n = toEnum $ length mPairs
+           !f = toEnum $ fromEnum rFmt
+       enumFromConn connection $ \c ->
+           B.useAsCString stmtName $ \s ->
+               withMany (maybeWith B.unsafeUseAsCString) values $ \c_values ->
                    withArray c_values $ \vs ->
                        withArray c_lengths $ \ls ->
                            withArray formats $ \fs ->
