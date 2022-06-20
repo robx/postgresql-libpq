@@ -1735,7 +1735,7 @@ sendQueryParamsC connection statement params rFmt =
                                     )
       accum (!a,!b,!c,!d) (Just (t,v,f)) = ( t:a
                                            , (Just v):b
-                                           , (B.length v):c
+                                           , (B.length v - 1):c
                                            , (toEnum $ fromEnum f):d
                                            )
 
@@ -1811,7 +1811,7 @@ sendQueryPreparedC connection stmtName mPairs rFmt =
                                        , 0:c
                                        )
       accum (!a,!b,!c) (Just (v, f)) = ( (Just v):a
-                                       , (B.length v):b
+                                       , (B.length v - 1):b
                                        , (toEnum $ fromEnum f):c
                                        )
 
