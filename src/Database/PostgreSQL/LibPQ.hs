@@ -37,6 +37,7 @@
 --
 -----------------------------------------------------------------------------
 
+{-# LANGUAGE CPP                        #-}
 {-# LANGUAGE ForeignFunctionInterface   #-}
 {-# LANGUAGE EmptyDataDecls             #-}
 {-# LANGUAGE OverloadedStrings          #-}
@@ -212,10 +213,6 @@ module Database.PostgreSQL.LibPQ
     )
 where
 
-#include <libpq-fe.h>
-#include <libpq/libpq-fs.h>
-#include "noticehandlers.h"
-
 import Prelude hiding ( print )
 import Foreign
 import Foreign.C.Types
@@ -225,7 +222,6 @@ import qualified Foreign.ForeignPtr.Unsafe as Unsafe
 #endif
 import qualified Foreign.Concurrent as FC
 import System.Posix.Types ( Fd(..) )
-import Data.List ( foldl' )
 import System.IO ( IOMode(..), SeekMode(..) )
 
 #if __GLASGOW_HASKELL__ >= 700
@@ -243,10 +239,12 @@ import qualified Data.ByteString as B
 
 import Control.Concurrent.MVar
 
-import Data.Typeable
-
 import Database.PostgreSQL.LibPQ.Compat
+import Database.PostgreSQL.LibPQ.Enums
 import Database.PostgreSQL.LibPQ.Internal
+import Database.PostgreSQL.LibPQ.Marshal
+import Database.PostgreSQL.LibPQ.Notify
+import Database.PostgreSQL.LibPQ.Oid
 
 #if __GLASGOW_HASKELL__ >= 700
 import Control.Exception (mask_)
@@ -431,7 +429,6 @@ resetStart :: Connection
 resetStart connection =
     enumFromConn connection c_PQresetStart
 
-
 -- | To initiate a connection reset, call 'resetStart'. If it returns
 -- 'False', the reset has failed. If it returns 'True', poll the reset
 -- using 'resetPoll' in exactly the same way as you would create the
@@ -440,24 +437,15 @@ resetPoll :: Connection
           -> IO PollingStatus
 resetPoll = pollHelper c_PQresetPoll
 
-data PollingStatus
-    = PollingFailed
-    | PollingReading
-    | PollingWriting
-    | PollingOk deriving (Eq, Show)
-
 pollHelper :: (Ptr PGconn -> IO CInt)
            -> Connection
            -> IO PollingStatus
 pollHelper poller connection =
     do code <- withConn connection poller
-       case code of
-         (#const PGRES_POLLING_READING) -> return PollingReading
-         (#const PGRES_POLLING_OK)      -> return PollingOk
-         (#const PGRES_POLLING_WRITING) -> return PollingWriting
-         (#const PGRES_POLLING_FAILED)  -> return PollingFailed
-         _ -> fail $ "unexpected polling status " ++ show code
-
+       maybe
+         (fail $ "unexpected polling status " ++ show code)
+         return
+         (fromCInt code)
 
 -- | Closes the connection to the server.
 --
@@ -523,20 +511,6 @@ statusString f connection =
              else Just `fmap` B.packCString cstr
 
 
-data ConnStatus
-    = ConnectionOk                 -- ^ The 'Connection' is ready.
-    | ConnectionBad                -- ^ The connection procedure has failed.
-    | ConnectionStarted            -- ^ Waiting for connection to be made.
-    | ConnectionMade               -- ^ Connection OK; waiting to send.
-    | ConnectionAwaitingResponse   -- ^ Waiting for a response from the server.
-    | ConnectionAuthOk             -- ^ Received authentication;
-                                   -- waiting for backend start-up to
-                                   -- finish.
-    | ConnectionSetEnv             -- ^ Negotiating environment-driven
-                                   -- parameter settings.
-    | ConnectionSSLStartup         -- ^ Negotiating SSL encryption.
-      deriving (Eq, Show)
-
 
 -- | Returns the status of the connection.
 --
@@ -555,25 +529,11 @@ status :: Connection
        -> IO ConnStatus
 status connection = do
   stat <- withConn connection c_PQstatus
-  case stat of
-    (#const CONNECTION_OK)               -> return ConnectionOk
-    (#const CONNECTION_BAD)              -> return ConnectionBad
-    (#const CONNECTION_STARTED)          -> return ConnectionStarted
-    (#const CONNECTION_MADE)             -> return ConnectionMade
-    (#const CONNECTION_AWAITING_RESPONSE)-> return ConnectionAwaitingResponse
-    (#const CONNECTION_AUTH_OK)          -> return ConnectionAuthOk
-    (#const CONNECTION_SETENV)           -> return ConnectionSetEnv
-    (#const CONNECTION_SSL_STARTUP)      -> return ConnectionSSLStartup
-    --(#const CONNECTION_NEEDED)           -> ConnectionNeeded
-    c -> fail $ "Unknown connection status " ++ show c
+  maybe
+    (fail $ "Unknown connection status " ++ show stat)
+    return
+    (fromCInt stat)
 
-
-data TransactionStatus = TransIdle    -- ^ currently idle
-                       | TransActive  -- ^ a command is in progress
-                       | TransInTrans -- ^ idle, in a valid transaction block
-                       | TransInError -- ^ idle, in a failed transaction block
-                       | TransUnknown -- ^ the connection is bad
-                         deriving (Eq, Show)
 
 -- | Returns the current in-transaction status of the server.
 --
@@ -582,14 +542,11 @@ data TransactionStatus = TransIdle    -- ^ currently idle
 transactionStatus :: Connection
                   -> IO TransactionStatus
 transactionStatus connection = do
-    stat <- withConn connection c_PQtransactionStatus
-    case stat of
-      (#const PQTRANS_IDLE)    -> return TransIdle
-      (#const PQTRANS_ACTIVE)  -> return TransActive
-      (#const PQTRANS_INTRANS) -> return TransInTrans
-      (#const PQTRANS_INERROR) -> return TransInError
-      (#const PQTRANS_UNKNOWN) -> return TransUnknown
-      c -> fail $ "Unknown transaction status " ++ show c
+  stat <- withConn connection c_PQtransactionStatus
+  maybe
+    (fail $ "Unknown transaction status " ++ show stat)
+    return
+    (fromCInt stat)
 
 
 -- | Looks up a current parameter setting of the server.
@@ -739,18 +696,10 @@ connectionUsedPassword connection =
 newtype Result = Result (ForeignPtr PGresult) deriving (Eq, Show)
 data PGresult
 
-data Format = Text | Binary deriving (Eq, Ord, Show, Enum)
-
-newtype Oid = Oid CUInt deriving (Eq, Ord, Read, Show, Storable, Typeable)
-
-invalidOid :: Oid
-invalidOid = Oid (#const InvalidOid)
-
-
 -- | Prepare the given parameter bytestring for passing on to libpq,
 -- without copying for binary parameters.
 --
--- This safe to use to pass parameters to libpq considering:
+-- This is safe to use to pass parameters to libpq considering:
 -- * libpq treats the parameter data as read-only
 -- * 'ByteString' uses pinned memory
 -- * the reference to the 'CString' doesn't escape
@@ -765,26 +714,29 @@ withParams :: [Maybe (Oid, B.ByteString, Format)]
            -> (CInt -> Ptr Oid -> Ptr CString -> Ptr CInt -> Ptr CInt -> IO a)
            -> IO a
 withParams params action =
-    withArray oids $ \ts ->
+    unsafeWithArray n oids $ \ts ->
         withMany (maybeWith unsafeUseParamAsCString) values $ \c_values ->
-            withArray c_values $ \vs ->
-                withArray c_lengths $ \ls ->
-                    withArrayLen formats $ \n fs ->
-                        action (toEnum n) ts vs ls fs
+            unsafeWithArray n c_values $ \vs ->
+                unsafeWithArray n c_lengths $ \ls ->
+                    unsafeWithArray n formats $ \fs ->
+                        action (intToCInt n) ts vs ls fs
   where
-    (oids, values, c_lengths, formats) =
-        foldl' accum ([],[],[],[]) $ reverse params
+    AccumParams n oids values c_lengths formats =
+        foldr accum (AccumParams 0 [] [] [] []) params
 
-    accum (!a,!b,!c,!d) Nothing = ( invalidOid:a
-                                  , Nothing:b
-                                  , 0:c
-                                  , 0:d
-                                  )
-    accum (!a,!b,!c,!d) (Just (t,v,f)) = ( t:a
-                                         , (Just (v,f)):b
-                                         , (toEnum $ B.length v):c
-                                         , (toEnum $ fromEnum f):d
-                                         )
+    accum :: Maybe (Oid, B.ByteString, Format) -> AccumParams -> AccumParams
+    accum Nothing ~(AccumParams i a b c d) =
+        AccumParams (i + 1) (invalidOid : a) (Nothing : b) (0 : c) (0 : d)
+
+    accum (Just (t,v,f)) ~(AccumParams i xs ys zs ws)  =
+        let !z = intToCInt (B.length v)
+            !w = toCInt f
+        in AccumParams (i + 1) (t : xs) (Just (v, f) : ys) (z : zs) (w : ws)
+
+intToCInt :: Int -> CInt
+intToCInt = toEnum
+
+data AccumParams = AccumParams !Int ![Oid] ![Maybe (B.ByteString, Format)] ![CInt] ![CInt]
 
 -- | Convert a list of parameters to the format expected by libpq FFI calls,
 -- prepared statement variant.
@@ -793,22 +745,24 @@ withParamsPrepared :: [Maybe (B.ByteString, Format)]
                    -> IO a
 withParamsPrepared params action =
     withMany (maybeWith unsafeUseParamAsCString) values $ \c_values ->
-        withArray c_values $ \vs ->
-            withArray c_lengths $ \ls ->
-                withArrayLen formats $ \n fs ->
-                    action (toEnum n) vs ls fs
+        unsafeWithArray n c_values $ \vs ->
+            unsafeWithArray n c_lengths $ \ls ->
+                unsafeWithArray n formats $ \fs ->
+                    action (intToCInt n) vs ls fs
   where
-    (values, c_lengths, formats) = foldl' accum ([],[],[]) $ reverse params
+    AccumPrepParams n values c_lengths formats =
+        foldr accum (AccumPrepParams 0 [] [] []) params
 
-    accum (!a,!b,!c) Nothing       = ( Nothing:a
-                                     , 0:b
-                                     , 0:c
-                                     )
-    accum (!a,!b,!c) (Just (v, f)) = ( (Just (v,f)):a
-                                     , (toEnum $ B.length v):b
-                                     , (toEnum $ fromEnum f):c
-                                     )
+    accum :: Maybe (B.ByteString, Format) -> AccumPrepParams -> AccumPrepParams
+    accum Nothing ~(AccumPrepParams i a b c) =
+        AccumPrepParams (i + 1) (Nothing : a) (0 : b) (0 : c)
 
+    accum (Just (v, f)) ~(AccumPrepParams i xs ys zs) =
+        let !y = intToCInt (B.length v)
+            !z = toCInt f
+        in AccumPrepParams (i + 1) (Just (v, f) : xs) (y : ys) (z : zs)
+
+data AccumPrepParams = AccumPrepParams !Int ![Maybe (B.ByteString, Format)] ![CInt] ![CInt]
 
 -- | Submits a command to the server and waits for the result.
 --
@@ -881,7 +835,7 @@ execParams connection statement params rFmt =
             withParams params $ \n ts vs ls fs ->
                 c_PQexecParams c s n ts vs ls fs f
   where
-    !f = toEnum $ fromEnum rFmt
+    !f = toCInt rFmt
 
 
 -- | Submits a request to create a prepared statement with the given
@@ -929,9 +883,8 @@ prepare connection stmtName query mParamTypes =
     resultFromConn connection $ \c ->
         B.useAsCString stmtName $ \s ->
             B.useAsCString query $ \q ->
-                maybeWith withArray mParamTypes $ \o ->
-                    let l = maybe 0 (toEnum . length) mParamTypes
-                    in c_PQprepare c s q l o
+                maybeWithInt withArrayLen mParamTypes $ \l o ->
+                    c_PQprepare c s q (intToCInt l) o
 
 
 -- | Sends a request to execute a prepared statement with given
@@ -962,7 +915,7 @@ execPrepared connection stmtName params rFmt =
             withParamsPrepared params $ \n vs ls fs ->
                 c_PQexecPrepared c s n vs ls fs f
     where
-      !f = toEnum $ fromEnum rFmt
+      !f = toCInt rFmt
 
 
 -- | Submits a request to obtain information about the specified
@@ -1011,52 +964,6 @@ describePortal connection portalName =
         B.useAsCString portalName $ \p ->
             c_PQdescribePortal c p
 
-
-data ExecStatus = EmptyQuery    -- ^ The string sent to the server was empty.
-                | CommandOk     -- ^ Successful completion of a
-                                -- command returning no data.
-                | TuplesOk      -- ^ Successful completion of a
-                                -- command returning data (such as a
-                                -- SELECT or SHOW).
-                | CopyOut       -- ^ Copy Out (from server) data
-                                -- transfer started.
-                | CopyIn        -- ^ Copy In (to server) data transfer
-                                -- started.
-                | CopyBoth      -- ^ Copy In/Out data transfer started.
-                | BadResponse   -- ^ The server's response was not understood.
-                | NonfatalError -- ^ A nonfatal error (a notice or
-                                -- warning) occurred.
-                | FatalError    -- ^ A fatal error occurred.
-                | SingleTuple   -- ^ The PGresult contains a single result tuple
-                                -- from the current command. This status occurs
-                                -- only when single-row mode has been selected
-                                -- for the query.
-                  deriving (Eq, Show)
-
-instance Enum ExecStatus where
-    toEnum (#const PGRES_EMPTY_QUERY)    = EmptyQuery
-    toEnum (#const PGRES_COMMAND_OK)     = CommandOk
-    toEnum (#const PGRES_TUPLES_OK)      = TuplesOk
-    toEnum (#const PGRES_COPY_OUT)       = CopyOut
-    toEnum (#const PGRES_COPY_IN)        = CopyIn
-    toEnum (#const PGRES_COPY_BOTH)      = CopyBoth
-    toEnum (#const PGRES_BAD_RESPONSE)   = BadResponse
-    toEnum (#const PGRES_NONFATAL_ERROR) = NonfatalError
-    toEnum (#const PGRES_FATAL_ERROR)    = FatalError
-    toEnum (#const PGRES_SINGLE_TUPLE)   = SingleTuple
-    toEnum _ = error "Database.PQ.Enum.ExecStatus.toEnum: bad argument"
-
-    fromEnum EmptyQuery    = (#const PGRES_EMPTY_QUERY)
-    fromEnum CommandOk     = (#const PGRES_COMMAND_OK)
-    fromEnum TuplesOk      = (#const PGRES_TUPLES_OK)
-    fromEnum CopyOut       = (#const PGRES_COPY_OUT)
-    fromEnum CopyIn        = (#const PGRES_COPY_IN)
-    fromEnum CopyBoth      = (#const PGRES_COPY_BOTH)
-    fromEnum BadResponse   = (#const PGRES_BAD_RESPONSE)
-    fromEnum NonfatalError = (#const PGRES_NONFATAL_ERROR)
-    fromEnum FatalError    = (#const PGRES_FATAL_ERROR)
-    fromEnum SingleTuple   = (#const PGRES_SINGLE_TUPLE)
-
 -- | Returns the result status of the command.
 resultStatus :: Result
              -> IO ExecStatus
@@ -1069,7 +976,7 @@ resultStatus result = enumFromResult result c_PQresultStatus
 resStatus :: ExecStatus
           -> IO B.ByteString
 resStatus es =
-    do cstr <- c_PQresStatus $ fromIntegral $ fromEnum es
+    do cstr <- c_PQresStatus $ toCInt es
        len <- B.c_strlen cstr
        fp <- newForeignPtr_ $ castPtr cstr
        return $ B.fromForeignPtr fp 0 $ fromIntegral len
@@ -1092,109 +999,6 @@ resultErrorMessage = flip maybeBsFromResult c_PQresultErrorMessage
 
 unsafeFreeResult :: Result -> IO ()
 unsafeFreeResult (Result x) = finalizeForeignPtr x
-
-
-data FieldCode = DiagSeverity
-               -- ^ The severity; the field contents are ERROR, FATAL,
-               -- or PANIC (in an error message), or WARNING, NOTICE,
-               -- DEBUG, INFO, or LOG (in a notice message), or a
-               -- localized translation of one of these. Always
-               -- present.
-
-               | DiagSqlstate
-               -- ^ The SQLSTATE code for the error. The SQLSTATE code
-               -- identifies the type of error that has occurred; it
-               -- can be used by front-end applications to perform
-               -- specific operations (such as error handling) in
-               -- response to a particular database error. For a list
-               -- of the possible SQLSTATE codes, see Appendix A. This
-               -- field is not localizable, and is always present.
-
-               | DiagMessagePrimary
-               -- ^ The primary human-readable error message
-               -- (typically one line). Always present.
-
-               | DiagMessageDetail
-               -- ^ Detail: an optional secondary error message
-               -- carrying more detail about the problem. Might run to
-               -- multiple lines.
-
-               | DiagMessageHint
-               -- ^ Hint: an optional suggestion what to do about the
-               -- problem. This is intended to differ from detail in
-               -- that it offers advice (potentially inappropriate)
-               -- rather than hard facts. Might run to multiple lines.
-
-               | DiagStatementPosition
-               -- ^ A string containing a decimal integer indicating
-               -- an error cursor position as an index into the
-               -- original statement string. The first character has
-               -- index 1, and positions are measured in characters
-               -- not bytes.
-
-               | DiagInternalPosition
-               -- ^ This is defined the same as the
-               -- 'DiagStatementPosition' field, but it is used when
-               -- the cursor position refers to an internally
-               -- generated command rather than the one submitted by
-               -- the client. The 'DiagInternalQuery' field will
-               -- always appear when this field appears.
-
-               | DiagInternalQuery
-               -- ^ The text of a failed internally-generated
-               -- command. This could be, for example, a SQL query
-               -- issued by a PL/pgSQL function.
-
-               | DiagContext
-               -- ^ An indication of the context in which the error
-               -- occurred. Presently this includes a call stack
-               -- traceback of active procedural language functions
-               -- and internally-generated queries. The trace is one
-               -- entry per line, most recent first.
-
-               | DiagSourceFile
-               -- ^ The file name of the source-code location where
-               -- the error was reported.
-
-               | DiagSourceLine
-               -- ^ The line number of the source-code location where
-               -- the error was reported.
-
-               | DiagSourceFunction
-               -- ^ The name of the source-code function reporting the
-               -- error.
-
-                 deriving (Eq, Show)
-
-
-instance Enum FieldCode where
-    toEnum (#const PG_DIAG_SEVERITY)           = DiagSeverity
-    toEnum (#const PG_DIAG_SQLSTATE)           = DiagSqlstate
-    toEnum (#const PG_DIAG_MESSAGE_PRIMARY)    = DiagMessagePrimary
-    toEnum (#const PG_DIAG_MESSAGE_DETAIL)     = DiagMessageDetail
-    toEnum (#const PG_DIAG_MESSAGE_HINT)       = DiagMessageHint
-    toEnum (#const PG_DIAG_STATEMENT_POSITION) = DiagStatementPosition
-    toEnum (#const PG_DIAG_INTERNAL_POSITION)  = DiagInternalPosition
-    toEnum (#const PG_DIAG_INTERNAL_QUERY)     = DiagInternalQuery
-    toEnum (#const PG_DIAG_CONTEXT)            = DiagContext
-    toEnum (#const PG_DIAG_SOURCE_FILE)        = DiagSourceFile
-    toEnum (#const PG_DIAG_SOURCE_LINE)        = DiagSourceLine
-    toEnum (#const PG_DIAG_SOURCE_FUNCTION)    = DiagSourceFunction
-    toEnum _ = error "Database.PQ.Enum.FieldCode.toEnum: bad argument"
-
-    fromEnum DiagSeverity          = (#const PG_DIAG_SEVERITY)
-    fromEnum DiagSqlstate          = (#const PG_DIAG_SQLSTATE)
-    fromEnum DiagMessagePrimary    = (#const PG_DIAG_MESSAGE_PRIMARY)
-    fromEnum DiagMessageDetail     = (#const PG_DIAG_MESSAGE_DETAIL)
-    fromEnum DiagMessageHint       = (#const PG_DIAG_MESSAGE_HINT)
-    fromEnum DiagStatementPosition = (#const PG_DIAG_STATEMENT_POSITION)
-    fromEnum DiagInternalPosition  = (#const PG_DIAG_INTERNAL_POSITION)
-    fromEnum DiagInternalQuery     = (#const PG_DIAG_INTERNAL_QUERY)
-    fromEnum DiagContext           = (#const PG_DIAG_CONTEXT)
-    fromEnum DiagSourceFile        = (#const PG_DIAG_SOURCE_FILE)
-    fromEnum DiagSourceLine        = (#const PG_DIAG_SOURCE_LINE)
-    fromEnum DiagSourceFunction    = (#const PG_DIAG_SOURCE_FUNCTION)
-
 
 -- | Returns an individual field of an error report.
 --
@@ -1220,7 +1024,7 @@ resultErrorField :: Result
                  -> IO (Maybe B.ByteString)
 resultErrorField (Result fp) fieldcode =
     maybeBsFromForeignPtr fp $ \res ->
-        c_PQresultErrorField res $ fromIntegral $ fromEnum fieldcode
+        c_PQresultErrorField res $ toCInt fieldcode
 
 
 -- $queryresultinfo
@@ -1365,13 +1169,14 @@ getvalue :: Result
 getvalue (Result fp) (Row rowNum) (Col colNum) =
     withForeignPtr fp $ \ptr -> do
       isnull <- c_PQgetisnull ptr rowNum colNum
-      if toEnum $ fromIntegral isnull
-        then return $ Nothing
-
-        else do cstr <- c_PQgetvalue ptr rowNum colNum
-                l <- c_PQgetlength ptr rowNum colNum
-                fp' <- FC.newForeignPtr (castPtr cstr) finalizer
-                return $! Just $! B.fromForeignPtr fp' 0 $ fromIntegral l
+      case fromCInt isnull of
+        Just True  -> return Nothing
+        Just False -> do
+          cstr <- c_PQgetvalue ptr rowNum colNum
+          l <- c_PQgetlength ptr rowNum colNum
+          fp' <- FC.newForeignPtr (castPtr cstr) finalizer
+          return $! Just $! B.fromForeignPtr fp' 0 $ fromIntegral l
+        Nothing -> fail $ "fromCInt @Bool " ++ show isnull
 
     where
       finalizer = touchForeignPtr fp
@@ -1389,12 +1194,13 @@ getvalue' :: Result
 getvalue' res (Row rowNum) (Col colNum) =
     withResult res $ \ptr -> do
       isnull <- c_PQgetisnull ptr rowNum colNum
-      if toEnum $ fromIntegral isnull
-        then return $ Nothing
-
-        else do cstr <- c_PQgetvalue ptr rowNum colNum
-                l <- fromIntegral `fmap` c_PQgetlength ptr rowNum colNum
-                Just `fmap` B.packCStringLen (cstr, l)
+      case fromCInt isnull of
+        Just True  -> return Nothing
+        Just False -> do
+          cstr <- c_PQgetvalue ptr rowNum colNum
+          l <- fromIntegral `fmap` c_PQgetlength ptr rowNum colNum
+          Just `fmap` B.packCStringLen (cstr, l)
+        Nothing -> fail $ "fromCInt @Bool " ++ show isnull
 
 
 -- | Tests a field for a null value. Row and column numbers start at
@@ -1646,7 +1452,7 @@ data CopyOutResult
 --   while waiting for data.
 getCopyData :: Connection -> Bool -> IO CopyOutResult
 getCopyData conn async = alloca $ \strp -> withConn conn $ \c -> do
-    len <- c_PQgetCopyData c strp $! (fromIntegral (fromEnum async))
+    len <- c_PQgetCopyData c strp $! toCInt async
     if len <= 0
       then case compare len (-1) of
              LT -> return CopyOutError
@@ -1712,7 +1518,7 @@ sendQueryParams connection statement params rFmt =
                 c_PQsendQueryParams c s n ts vs ls fs f
 
     where
-      !f = toEnum $ fromEnum rFmt
+      !f = toCInt rFmt
 
 
 -- | Sends a request to create a prepared statement with the given
@@ -1726,9 +1532,8 @@ sendPrepare connection stmtName query mParamTypes =
     enumFromConn connection $ \c ->
         B.useAsCString stmtName $ \s ->
             B.useAsCString query $ \q ->
-                maybeWith withArray mParamTypes $ \o ->
-                    let l = maybe 0 (toEnum . length) mParamTypes
-                    in c_PQsendPrepare c s q l o
+                maybeWithInt withArrayLen mParamTypes $ \l o ->
+                    c_PQsendPrepare c s q (intToCInt l) o
 
 
 -- | Sends a request to execute a prepared statement with given
@@ -1745,7 +1550,7 @@ sendQueryPrepared connection stmtName params rFmt =
                 c_PQsendQueryPrepared c s n vs ls fs f
 
     where
-      !f = toEnum $ fromEnum rFmt
+      !f = toCInt rFmt
 
 
 -- | Submits a request to obtain information about the specified
@@ -1826,9 +1631,8 @@ isBusy connection = enumFromConn connection c_PQisBusy
 setnonblocking :: Connection
                -> Bool
                -> IO Bool
-setnonblocking connection blocking =
-    do let arg = fromIntegral $ fromEnum blocking
-       stat <- withConn connection $ \ptr -> c_PQsetnonblocking ptr arg
+setnonblocking connection blocking = do
+       stat <- withConn connection $ \ptr -> c_PQsetnonblocking ptr (toCInt blocking)
        return $! stat == 0
 
 
@@ -1939,35 +1743,7 @@ cancel (Cancel fp) =
 -- ordinary SQL commands. The arrival of NOTIFY messages can
 -- subsequently be detected by calling 'notifies'.
 
-data Notify = Notify {
-      notifyRelname :: {-# UNPACK #-} !B.ByteString -- ^ notification channel name
-    , notifyBePid   :: {-# UNPACK #-} !CPid         -- ^ process ID of notifying server process
-    , notifyExtra   :: {-# UNPACK #-} !B.ByteString -- ^ notification payload string
-    } deriving Show
 
-#if __GLASGOW_HASKELL__ < 800
-#let alignment t = "%lu", (unsigned long)offsetof(struct {char x__; t (y__); }, y__)
-#endif
-instance Storable Notify where
-  sizeOf _ = #{size PGnotify}
-
-  alignment _ = #{alignment PGnotify}
-
-  peek ptr = do
-      relname <- B.packCString =<< #{peek PGnotify, relname} ptr
-      extra   <- B.packCString =<< #{peek PGnotify, extra} ptr
-      be_pid  <- fmap f $ #{peek PGnotify, be_pid} ptr
-      return $! Notify relname be_pid extra
-      where
-        f :: CInt -> CPid
-        f = fromIntegral
-
-  poke ptr (Notify a b c) =
-      B.useAsCString a $ \a' ->
-        B.useAsCString c $ \c' ->
-            do #{poke PGnotify, relname} ptr a'
-               #{poke PGnotify, be_pid}  ptr (fromIntegral b :: CInt)
-               #{poke PGnotify, extra}   ptr c'
 
 
 -- | Returns the next notification from a list of unhandled
@@ -2013,21 +1789,6 @@ setClientEncoding connection enc =
        return $! stat == 0
 
 
-data Verbosity = ErrorsTerse
-               | ErrorsDefault
-               | ErrorsVerbose deriving (Eq, Show)
-
-instance Enum Verbosity where
-    toEnum (#const PQERRORS_TERSE)   = ErrorsTerse
-    toEnum (#const PQERRORS_DEFAULT) = ErrorsDefault
-    toEnum (#const PQERRORS_VERBOSE) = ErrorsVerbose
-    toEnum _ = error "Database.PQ.Enum.Verbosity.toEnum: bad argument"
-
-    fromEnum ErrorsTerse   = (#const PQERRORS_TERSE)
-    fromEnum ErrorsDefault = (#const PQERRORS_DEFAULT)
-    fromEnum ErrorsVerbose = (#const PQERRORS_VERBOSE)
-
-
 -- | Determines the verbosity of messages returned by 'errorMessage'
 -- and 'resultErrorMessage'.
 --
@@ -2045,12 +1806,13 @@ setErrorVerbosity :: Connection
                   -> IO Verbosity
 setErrorVerbosity connection verbosity =
     enumFromConn connection $ \p ->
-        c_PQsetErrorVerbosity p $ fromIntegral $ fromEnum verbosity
+        c_PQsetErrorVerbosity p $ toCInt verbosity
 
-enumFromConn :: (Integral a, Enum b) => Connection
-             -> (Ptr PGconn -> IO a)
+enumFromConn :: FromCInt b
+             => Connection
+             -> (Ptr PGconn -> IO CInt)
              -> IO b
-enumFromConn connection f = fmap (toEnum . fromIntegral) $ withConn connection f
+enumFromConn connection f = withConn connection f >>= maybe (fail "enumFromConn") return . fromCInt
 
 
 resultFromConn :: Connection
@@ -2076,10 +1838,11 @@ numFromResult :: (Integral a, Num b) => Result
 numFromResult result f = fmap fromIntegral $ withResult result f
 
 
-enumFromResult :: (Integral a, Enum b) => Result
-               -> (Ptr PGresult -> IO a)
+enumFromResult :: FromCInt b
+               => Result
+               -> (Ptr PGresult -> IO CInt)
                -> IO b
-enumFromResult result f = fmap (toEnum . fromIntegral) $ withResult result f
+enumFromResult result f = withResult result f >>= maybe (fail "enumFromResult") return . fromCInt
 
 
 -- | Returns a ByteString with a finalizer that touches the ForeignPtr
@@ -2128,8 +1891,6 @@ maybeBsFromForeignPtr fp f =
 
 type NoticeReceiver = NoticeBuffer -> Ptr PGresult -> IO ()
 
-data PGnotice
-
 -- | Upon connection initialization, any notices received from the server are
 --   normally written to the console.  Notices are akin to warnings, and
 --   are distinct from notifications.  This function suppresses notices.
@@ -2167,8 +1928,8 @@ getNotice (Conn _ nbRef) =
         then return Nothing
         else do
           fp <- newForeignPtr finalizerFree (castPtr np)
-          len  <- #{peek PGnotice, len} np
-          return $! Just $! mkPS fp (#offset PGnotice, str) len
+          len  <- pgNoticePeekLen np
+          return $! Just $! mkPS fp pgNoticeOffsetStr (fromIntegral len)
 
 -- $largeobjects
 
@@ -2178,11 +1939,7 @@ getNotice (Conn _ nbRef) =
 newtype LoFd = LoFd CInt deriving (Eq, Ord, Show)
 
 loMode :: IOMode -> CInt
-loMode mode = case mode of
-                ReadMode      -> (#const INV_READ)
-                WriteMode     -> (#const INV_WRITE)
-                ReadWriteMode -> (#const INV_READ) .|. (#const INV_WRITE)
-                AppendMode    -> (#const INV_WRITE)
+loMode = toCInt
 
 toMaybeOid :: Oid -> IO (Maybe Oid)
 toMaybeOid oid | oid == invalidOid = return Nothing
@@ -2280,7 +2037,7 @@ loOpen connection oid mode
                 --         handling is likely to be slightly wrong.  Start by
                 --         reading the source of lo_open, lo_lseek, and
                 --         lo_close.
-                err <- c_lo_lseek c fd 0 (#const SEEK_END)
+                err <- c_lo_lseek c fd 0 (toCInt SeekFromEnd)
                 case err of
                   -1 -> do
                           -- the lo_lseek failed, so we try to close the fd
@@ -2328,10 +2085,7 @@ loSeek :: Connection -> LoFd -> SeekMode -> Int -> IO (Maybe Int)
 loSeek connection (LoFd fd) seekmode delta
     = withConn connection $ \c -> do
         let d = fromIntegral delta
-        pos <- c_lo_lseek c fd d $ case seekmode of
-                                     AbsoluteSeek -> #const SEEK_SET
-                                     RelativeSeek -> #const SEEK_CUR
-                                     SeekFromEnd  -> #const SEEK_END
+        pos <- c_lo_lseek c fd d $ toCInt seekmode
         nonnegInt pos
 
 -- | Obtains the current read or write location of a large object descriptor.
