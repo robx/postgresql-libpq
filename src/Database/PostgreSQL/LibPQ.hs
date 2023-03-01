@@ -173,6 +173,7 @@ module Database.PostgreSQL.LibPQ
 
     -- * Pipeline Mode
     -- $pipeline
+    , PipelineStatus(..)
     , pipelineStatus
     , enterPipelineMode
     , exitPipelineMode
@@ -2441,7 +2442,7 @@ foreign import ccall unsafe "libpq-fe.h PQfreemem"
 foreign import ccall        "libpq-fs.h PQpipelineStatus"
     c_PQpipelineStatus :: Ptr PGconn -> IO CInt
 
-foreign import ccall        "libpq-fs.h PQexitPipelineMode"
+foreign import ccall        "libpq-fs.h PQenterPipelineMode"
     c_PQenterPipelineMode :: Ptr PGconn -> IO CInt
 
 foreign import ccall        "libpq-fs.h PQexitPipelineMode"
