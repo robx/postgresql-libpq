@@ -171,6 +171,10 @@ module Database.PostgreSQL.LibPQ
     , FlushStatus(..)
     , flush
 
+    -- * Pipeline Mode
+    -- $pipeline
+    , pipelineStatus
+
     -- * Cancelling Queries in Progress
     -- $cancel
     , Cancel
@@ -1675,6 +1679,16 @@ flush connection =
          _ -> return FlushFailed
 
 
+pipelineStatus :: Connection
+               -> IO PipelineStatus
+pipelineStatus connection = do
+  stat <- withConn connection c_PQpipelineStatus
+  maybe
+    (fail $ "Unknown pipeline status " ++ show stat)
+    return
+    (fromCInt stat)
+
+
 -- $cancel
 -- A client application can request cancellation of a command that is
 -- still being processed by the server, using the functions described
@@ -2399,6 +2413,9 @@ foreign import ccall unsafe "libpq-fe.h &PQfreemem"
 
 foreign import ccall unsafe "libpq-fe.h PQfreemem"
     c_PQfreemem :: Ptr a -> IO ()
+
+foreign import ccall        "libpq-fs.h PQpipelineStatus"
+    c_PQpipelineStatus :: Ptr PGconn -> IO CInt
 
 foreign import ccall unsafe "noticehandlers.h hs_postgresql_libpq_malloc_noticebuffer"
     c_malloc_noticebuffer :: IO (Ptr CNoticeBuffer)
