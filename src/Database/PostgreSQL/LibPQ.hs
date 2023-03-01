@@ -174,6 +174,10 @@ module Database.PostgreSQL.LibPQ
     -- * Pipeline Mode
     -- $pipeline
     , pipelineStatus
+    , enterPipelineMode
+    , exitPipelineMode
+    , pipelineSync
+    , sendFlushRequest
 
     -- * Cancelling Queries in Progress
     -- $cancel
@@ -1682,11 +1686,31 @@ flush connection =
 pipelineStatus :: Connection
                -> IO PipelineStatus
 pipelineStatus connection = do
-  stat <- withConn connection c_PQpipelineStatus
-  maybe
-    (fail $ "Unknown pipeline status " ++ show stat)
-    return
-    (fromCInt stat)
+    stat <- withConn connection c_PQpipelineStatus
+    maybe
+      (fail $ "Unknown pipeline status " ++ show stat)
+      return
+      (fromCInt stat)
+
+enterPipelineMode :: Connection
+                  -> IO Bool
+enterPipelineMode connection =
+    enumFromConn connection c_PQenterPipelineMode
+
+exitPipelineMode :: Connection
+                 -> IO Bool
+exitPipelineMode connection =
+    enumFromConn connection c_PQexitPipelineMode
+
+pipelineSync :: Connection
+             -> IO Bool
+pipelineSync connection =
+    enumFromConn connection c_PQpipelineSync
+
+sendFlushRequest :: Connection
+                 -> IO Bool
+sendFlushRequest connection =
+    enumFromConn connection c_PQsendFlushRequest
 
 
 -- $cancel
@@ -2416,6 +2440,18 @@ foreign import ccall unsafe "libpq-fe.h PQfreemem"
 
 foreign import ccall        "libpq-fs.h PQpipelineStatus"
     c_PQpipelineStatus :: Ptr PGconn -> IO CInt
+
+foreign import ccall        "libpq-fs.h PQexitPipelineMode"
+    c_PQenterPipelineMode :: Ptr PGconn -> IO CInt
+
+foreign import ccall        "libpq-fs.h PQexitPipelineMode"
+    c_PQexitPipelineMode :: Ptr PGconn -> IO CInt
+
+foreign import ccall        "libpq-fs.h PQpipelineSync"
+    c_PQpipelineSync :: Ptr PGconn -> IO CInt
+
+foreign import ccall        "libpq-fs.h PQsendFlushRequest"
+    c_PQsendFlushRequest :: Ptr PGconn -> IO CInt
 
 foreign import ccall unsafe "noticehandlers.h hs_postgresql_libpq_malloc_noticebuffer"
     c_malloc_noticebuffer :: IO (Ptr CNoticeBuffer)
