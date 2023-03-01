@@ -39,10 +39,21 @@ data ExecStatus
     | NonfatalError -- ^ A nonfatal error (a notice or
                     -- warning) occurred.
     | FatalError    -- ^ A fatal error occurred.
-    | SingleTuple   -- ^ The PGresult contains a single result tuple
+    | SingleTuple   -- ^ The 'Result' contains a single result tuple
                     -- from the current command. This status occurs
                     -- only when single-row mode has been selected
                     -- for the query.
+    | PipelineSync  -- ^ The 'Result' represents a synchronization
+                    -- point in pipeline mode, requested by
+                    -- 'pipelineSync'. This status occurs only
+                    -- when pipeline mode has been selected.
+    | PipelineAborted  -- ^ The 'Result' represents a pipeline that
+                       -- has received an error from the server.
+                       -- 'getResult' must be called repeatedly,
+                       -- and each time it will return this status
+                       -- code until the end of the current pipeline,
+                       -- at which point it will return 'PipelineSync'
+                       -- and normal processing can resume.
   deriving (Eq, Show)
 
 instance FromCInt ExecStatus where
@@ -56,6 +67,8 @@ instance FromCInt ExecStatus where
     fromCInt (#const PGRES_NONFATAL_ERROR) = Just NonfatalError
     fromCInt (#const PGRES_FATAL_ERROR)    = Just FatalError
     fromCInt (#const PGRES_SINGLE_TUPLE)   = Just SingleTuple
+    fromCInt (#const PGRES_PIPELINE_SYNC)  = Just PipelineSync
+    fromCInt (#const PGRES_PIPELINE_ABORTED) = Just PipelineAborted
     fromCInt _ = Nothing
 
 instance ToCInt ExecStatus where
@@ -69,6 +82,8 @@ instance ToCInt ExecStatus where
     toCInt NonfatalError = (#const PGRES_NONFATAL_ERROR)
     toCInt FatalError    = (#const PGRES_FATAL_ERROR)
     toCInt SingleTuple   = (#const PGRES_SINGLE_TUPLE)
+    toCInt PipelineSync  = (#const PGRES_PIPELINE_SYNC)
+    toCInt PipelineAborted  = (#const PGRES_PIPELINE_ABORTED)
 
 
 data FieldCode
