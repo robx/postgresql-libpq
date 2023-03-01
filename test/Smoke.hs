@@ -46,6 +46,7 @@ smoke connstring = do
     transactionStatus conn >>= print
     protocolVersion conn   >>= print
     serverVersion conn     >>= print
+    pipelineStatus conn    >>= print
 
     s <- status conn
     unless (s == ConnectionOk) exitFailure
